@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-财报雷达 · Earnings Radar  v0.1.0
+财报雷达 · Earnings Radar  v0.1.1
 
 财报事件 + 期权隐含波动 分析工具（美股为主）。
 数据源：Longbridge CLI（需已安装并登录，https://open.longbridge.com）
@@ -12,6 +12,11 @@
   3. 近 N 季财报日实际波动分布
   4. IV vs 历史波动率对比
   5. 暗底 HTML 报告 + CSV
+
+v0.1.1 更新（按社区反馈）：
+  - 每行标注 DTE（距到期日历天数）与「顺延」标记（首选到期日无报价时自动顺延的会标出）
+  - 实际波动样本由 8 季扩大至 12 季，并标注样本量 n
+  - README 增加「口径与局限」说明（窗口差异、DTE 影响、比值定性）
 
 用法：
   python3 earnings_radar.py --tickers NKE,MU,COST
@@ -31,9 +36,10 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DEFAULT_DAYS = 45          # 未来多少天内视为"即将到来的财报"
 DEFAULT_HIST_YEARS = 3     # 取多少年历史财报做统计
+DEFAULT_LOOKBACK = 12      # 实际波动样本数（季）
 CLI_CALL_GAP = 0.35        # Longbridge CLI 调用间隔（避免触发限频）
 
 
@@ -186,8 +192,11 @@ def implied_move(cli, sym, spot, earnings_iso, max_probe=4):
 
     首选到期日 = 财报日之后最近的到期日；若其无报价数据（部分新挂合约仅有代码），
     自动尝试随后到期日（最多 max_probe 个），取第一个有可用报价的。
+    返回值中 fallback=True 表示发生过顺延：跨式会混入额外时间价值，
+    调用方应结合 dte/gap（距到期、财报后）天数解读。
     """
     exps = [e for e in get_expiries(cli, sym) if e > earnings_iso][:max_probe]
+    primary = exps[0] if exps else None
     for exp in exps:
         chain = get_chain(cli, sym, exp)
         cand = []
@@ -209,11 +218,14 @@ def implied_move(cli, sym, spot, earnings_iso, max_probe=4):
         iv = (iv_c + iv_p) / 2.0 if (iv_c or iv_p) else None
         straddle = c + p
         return {"exp": exp, "strike": k, "straddle": straddle,
-                "move_pct": straddle / spot * 100.0, "iv": iv}
+                "move_pct": straddle / spot * 100.0, "iv": iv,
+                "primary_exp": primary, "fallback": exp != primary}
     return None
 
 
-def realized_moves(klines, past_events, lookback=8):
+def realized_moves(klines, past_events, lookback=None):
+    if lookback is None:
+        lookback = DEFAULT_LOOKBACK
     idx_by_date = {r["date"]: i for i, r in enumerate(klines)}
     dates = [r["date"] for r in klines]
     out = []
@@ -266,10 +278,10 @@ def analyze(cli, ticker_raw, days_ahead, hist_years):
         cal = get_calendar(cli, sym, start, end)
         today_iso = today.isoformat()
         upcoming = [e for e in cal
-                    if e["date"] >= today_iso and str(e.get("eps_act") or "") in ("", "None", "待公布")]
+                    if today_iso <= e["date"] <= end and str(e.get("eps_act") or "") in ("", "None", "待公布")]
         past = [e for e in cal if e["date"] < today_iso]
         nxt = upcoming[0] if upcoming else None
-        hist = realized_moves(kl, past, lookback=8)
+        hist = realized_moves(kl, past, lookback=DEFAULT_LOOKBACK)
         absm = sorted(abs(h["move"]) for h in hist)
         med = absm[len(absm) // 2] if absm else None
         imp = None
@@ -278,6 +290,14 @@ def analyze(cli, ticker_raw, days_ahead, hist_years):
                 imp = implied_move(cli, sym, spot, nxt["date"])
             except RadarError as exc:
                 row["err"] = str(exc)[:160]
+        if imp:
+            try:
+                exp_d = dt.date.fromisoformat(str(imp["exp"]))
+                imp["dte"] = (exp_d - today).days
+                imp["gap"] = (exp_d - dt.date.fromisoformat(nxt["date"])).days
+            except Exception:
+                imp["dte"] = None
+                imp["gap"] = None
         ratio = None
         if imp and med and med > 0:
             ratio = imp["move_pct"] / med
@@ -289,6 +309,7 @@ def analyze(cli, ticker_raw, days_ahead, hist_years):
             "eps_est": nxt.get("eps_est") if nxt else None,
             "rev_est": nxt.get("rev_est") if nxt else None,
             "hist": hist, "hist_med": med,
+            "hist_n": len(hist),
             "hist_mean": (sum(absm) / len(absm)) if absm else None,
             "implied": imp, "ratio": ratio,
             "hv30": hv_pct([r["close"] for r in kl]),
@@ -306,6 +327,16 @@ def fmt_pct(v, digits=1, sign=False):
     if v is None:
         return "-"
     s = ("+" if sign and v > 0 else "") + ("%.*f" % (digits, v)) + "%"
+    return s
+
+
+def dte_suffix(imp):
+    """DTE ± 顺延 标记串。"""
+    if not imp or imp.get("dte") is None:
+        return ""
+    s = "DTE%dd" % imp["dte"]
+    if imp.get("fallback"):
+        s += "·顺延"
     return s
 
 
@@ -329,12 +360,15 @@ def print_console(rows):
         ivhv = "%s/%s" % (fmt_pct(iv, 0), fmt_pct(hv, 0)) if (iv or hv) else "-"
         label, _ = ratio_label(r.get("ratio"))
         note = label if r.get("ratio") else (r.get("err") or "")
-        if r.get("ratio") is None and r.get("implied"):
+        if r.get("ratio") is None and r.get("implied") and not r.get("err"):
             note = "样本不足"
         if not r.get("next_date"):
             note = "窗口内无已确认财报"
         elif not r.get("implied") and not r.get("err"):
             note = "无期权数据"
+        dts = dte_suffix(r.get("implied"))
+        if dts and r.get("implied"):
+            note = ("%s · %s" % (note, dts)) if note and note != "-" else dts
         print("%-7s %-9.2f %-16s %-9s %-9s %-7s %-13s %s"
               % (r["name"], r["spot"], nxt, imp_s, med_s, ratio_s, ivhv, note))
 
@@ -424,7 +458,7 @@ def build_html(rows, days_ahead, generated):
 
     # ---- 汇总表
     s.append('<table class="sum"><tr><th>标的</th><th>现价</th><th>下个财报</th><th>隐含波动</th>'
-             '<th>历史中位</th><th>隐含/历史</th><th>ATM IV</th><th>HV30</th><th>判读</th></tr>')
+             '<th>DTE</th><th>历史中位</th><th>隐含/历史</th><th>ATM IV</th><th>HV30</th><th>判读</th></tr>')
     for r in ok_rows:
         nxt = "-"
         if r.get("next_date"):
@@ -432,11 +466,18 @@ def build_html(rows, days_ahead, generated):
         imp_pct = r["implied"]["move_pct"] if r.get("implied") else None
         iv = r["implied"]["iv"] if r.get("implied") else None
         label, tag = ratio_label(r.get("ratio"))
+        dte_s = "-"
+        if r.get("implied") and r["implied"].get("dte") is not None:
+            dte_s = "%dd" % r["implied"]["dte"]
+            if r["implied"].get("fallback"):
+                dte_s += "·顺延"
         s.append("<tr><td><b>%s</b></td><td class=\"mono\">%.2f</td><td class=\"mono\">%s</td>"
                  "<td class=\"mono amb\">%s</td><td class=\"mono\">%s</td><td class=\"mono\">%s</td>"
-                 "<td class=\"mono\">%s</td><td class=\"mono\">%s</td><td><span class=\"tag %s\">%s</span></td></tr>"
+                 "<td class=\"mono\">%s</td><td class=\"mono\">%s</td><td class=\"mono\">%s</td>"
+                 "<td><span class=\"tag %s\">%s</span></td></tr>"
                  % (r["name"], r["spot"], nxt,
                     ("±%.1f%%" % imp_pct) if imp_pct else "-",
+                    dte_s,
                     fmt_pct(r.get("hist_med")),
                     ("%.2fx" % r["ratio"]) if r.get("ratio") else "-",
                     fmt_pct(iv, 0),
@@ -460,16 +501,22 @@ def build_html(rows, days_ahead, generated):
         s.append('<div><div class="k">隐含波动（跨式定价）</div><div class="v amb">%s</div></div>'
                  % (("±%.1f%%" % imp["move_pct"]) if imp else "-"))
         s.append("</div>")
-        s.append('<div class="kv"><div><div class="k">历史中位 |波动|</div><div class="v">%s</div></div>'
-                 % fmt_pct(r.get("hist_med")))
+        s.append('<div class="kv"><div><div class="k">历史中位 |波动|（n=%d 季）</div><div class="v">%s</div></div>'
+                 % (len(r.get("hist") or []), fmt_pct(r.get("hist_med"))))
         s.append('<div><div class="k">隐含 / 历史</div><div class="v">%s</div></div>'
                  % (("%.2fx · " % r["ratio"]) + ratio_label(r["ratio"])[0] if r.get("ratio") else "-"))
         ivhv = "%s / %s" % (fmt_pct(imp["iv"], 0) if imp else "-", fmt_pct(r.get("hv30"), 0))
         s.append('<div><div class="k">ATM IV / HV30</div><div class="v">%s</div></div></div>' % ivhv)
         s.append(bar_html(r.get("hist") or [], imp["move_pct"] if imp else None))
         if imp:
-            s.append('<div class="impl">期权定价：<b>%s</b> 到期 · 行权价 <b>%.1f</b> · 跨式成本 <b>$%.2f</b></div>'
-                     % (imp["exp"], imp["strike"], imp["straddle"]))
+            dte_txt = ""
+            if imp.get("dte") is not None:
+                dte_txt = "（距今天 %d 天 · 财报后 %d 天）" % (imp["dte"], imp["gap"])
+            extra = ""
+            if imp.get("fallback"):
+                extra = " · 原首选 %s 无可用报价，已顺延" % imp.get("primary_exp")
+            s.append('<div class="impl">期权定价：<b>%s</b> 到期%s · 行权价 <b>%.1f</b> · 跨式成本 <b>$%.2f</b>%s</div>'
+                     % (imp["exp"], dte_txt, imp["strike"], imp["straddle"], extra))
         if r.get("err"):
             s.append('<div class="err">期权数据缺失：%s</div>' % r["err"])
         s.append("</div>")
@@ -484,7 +531,8 @@ def build_html(rows, days_ahead, generated):
         s.append("</div>")
 
     s.append('<div class="foot"><div>财报雷达 Earnings Radar v%s · 基于 Longbridge CLI 数据<br>'
-             '隐含波动 = 财报后首个到期日 ATM 跨式成本 / 现价；仅作事件定价参考，不构成投资建议。</div>'
+             '隐含波动 = 财报后首个到期日 ATM 跨式成本 / 现价（DTE=距到期日历天数；跨式含至到期的时间价值，'
+             'DTE 越大、越偏离事件本身的定价）· 仅供研究参考，不构成投资建议。</div>'
              '<div>Le Refuge 金融情报</div></div>' % VERSION)
     s.append("</div></body></html>")
     return "".join(s)
@@ -542,10 +590,11 @@ def main(argv=None):
     with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["symbol", "spot", "next_earnings", "timing", "implied_move_pct", "straddle",
-                    "atm_iv_pct", "hv30_pct", "hist_median_abs_pct", "ratio", "read", "expiry"])
+                    "atm_iv_pct", "hv30_pct", "hist_median_abs_pct", "hist_n", "ratio", "read",
+                    "expiry", "dte_days", "post_event_days", "fallback", "primary_exp"])
         for r in rows:
             if not r.get("ok"):
-                w.writerow([r["name"], "", "", "", "", "", "", "", "", "", "ERROR:" + str(r.get("err")), ""])
+                w.writerow([r["name"], "", "", "", "", "", "", "", "", "", "", "ERROR:" + str(r.get("err")), "", "", "", "", ""])
                 continue
             imp = r.get("implied") or {}
             label, _ = ratio_label(r.get("ratio"))
@@ -553,7 +602,12 @@ def main(argv=None):
                         "%.2f" % imp["move_pct"] if imp else "", "%.2f" % imp["straddle"] if imp else "",
                         "%.1f" % imp["iv"] if imp.get("iv") else "", "%.1f" % r["hv30"] if r.get("hv30") else "",
                         "%.2f" % r["hist_med"] if r.get("hist_med") else "",
-                        "%.2f" % r["ratio"] if r.get("ratio") else "", label, imp.get("exp") or ""])
+                        "%d" % (r.get("hist_n") or 0),
+                        "%.2f" % r["ratio"] if r.get("ratio") else "", label, imp.get("exp") or "",
+                        "%d" % imp["dte"] if imp.get("dte") is not None else "",
+                        "%d" % imp["gap"] if imp.get("gap") is not None else "",
+                        "顺延" if imp.get("fallback") else ("正常" if imp else ""),
+                        imp.get("primary_exp") or ""])
     print("\nHTML: %s\nCSV : %s" % (out_html, out_csv))
     return 0
 
