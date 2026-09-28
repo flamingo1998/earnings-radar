@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+reports/
+/earnings_radar_*.html
+/earnings_radar_*.csv

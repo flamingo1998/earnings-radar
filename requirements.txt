@@ -1,0 +1,4 @@
+# 本工具无第三方 Python 依赖（仅标准库）。
+# 运行前提：安装并登录 Longbridge CLI —— https://open.longbridge.com
+# No third-party Python packages required (stdlib only).
+# Runtime prerequisite: Longbridge CLI installed and logged in.
